@@ -13,7 +13,7 @@ if not tf.executing_eagerly():
 from waymo_open_dataset import dataset_pb2 as open_dataset
 from waymo_open_dataset.utils import camera_segmentation_utils
 from collections import defaultdict
-import os
+import os, cv2
 
 segmentation_3d_mapping_dic = {
     8: 2,
@@ -54,12 +54,22 @@ for i in range(29):
 if __name__ == "__main__":
     count = 0
 
-    target_dir = '/home/yiwei-guest/code/waymo/download/training_0005'
+    target_dir = '/home/yiwei-guest/code/waymo/download/training_0002'  # 4
     if not os.path.exists(target_dir):
         print(f"Target directory {target_dir} does not exist")
         exit(1)
     out_dir = os.path.join('/home/yiwei-guest/code/waymo/output', os.path.basename(os.path.normpath(target_dir)))
     os.makedirs(out_dir, exist_ok=True)
+
+    # 初始化深度图插值用的卷积核
+    kernel_shape = [17, 7]
+    kernel_y = [2**i for i in range(int(kernel_shape[0] / 2) + 1)]
+    kernel_y = kernel_y + kernel_y[-2::-1]
+    kernel_y = np.array(kernel_y).reshape(-1, 1)
+    kernel_x = [2**i for i in range(int(kernel_shape[1] / 2) + 1)]
+    kernel_x = kernel_x + kernel_x[-2::-1]
+    kernel_x = np.array(kernel_x).reshape(1, -1)
+    kernel = kernel_y @ kernel_x
 
     file_names = os.listdir(target_dir)
     for file_name in file_names:
@@ -114,6 +124,44 @@ if __name__ == "__main__":
                 )
                 semantic_label = lookup_table_2d[semantic_label]
                 frame_dic['image_semantic'] = semantic_label
+
+                # 位置
+                frame_dic['pose'] = np.array(frame.pose.transform).reshape(4, 4)
+
+                points, cp_points = frame_utils.convert_range_image_to_point_cloud(frame, range_images, camera_projections, range_image_top_pose)
+                points_all = np.concatenate(points, axis=0)
+                cp_points_all = np.concatenate(cp_points, axis=0)
+                images = sorted(frame.images, key=lambda i:i.name)
+
+                # The distance between lidar points and vehicle frame origin.
+                points_all_tensor = tf.norm(points_all, axis=-1, keepdims=True)
+                cp_points_all_tensor = tf.constant(cp_points_all, dtype=tf.int32)
+                
+                mask = tf.equal(cp_points_all_tensor[..., 0], images[0].name)  # 选出图片对应的投影点云
+                cp_points_all_tensor = tf.cast(tf.gather_nd(cp_points_all_tensor, tf.where(mask)), dtype=tf.float32)
+                points_all_tensor = tf.gather_nd(points_all_tensor, tf.where(mask))
+                projected_points_all_from_raw_data = tf.concat([cp_points_all_tensor[..., 1:3], points_all_tensor], axis=-1).numpy()
+
+                # 只取图片的下半部分
+                image_array = image_array[580:, :, :]
+                projected_points_all_from_raw_data[:, 1] -= 580
+                frame_dic['image_dp_slice'] = image_array
+
+                height, width = image_array.shape[:-1]
+                depth_image = np.zeros(image_array.shape[:-1], dtype=np.float32)
+                for i in range(len(projected_points_all_from_raw_data)):
+                    if not ((0 <= projected_points_all_from_raw_data[i][0] <= width - 1)
+                            and (0 <= projected_points_all_from_raw_data[i][1] <= height - 1)):
+                        continue
+                    u_ = int(round(projected_points_all_from_raw_data[i][0]))
+                    v_ = int(round(projected_points_all_from_raw_data[i][1]))
+                    depth_image[v_, u_] = projected_points_all_from_raw_data[i][2]
+
+                bin_depth = depth_image != 0
+                weight_sum = cv2.filter2D(bin_depth.astype(np.float32), -1, kernel)
+                depth_image = cv2.filter2D(depth_image, -1, kernel)
+                depth_image = depth_image / weight_sum
+                frame_dic['depth_image'] = depth_image
                 
                 save_name = os.path.basename(os.path.normpath(target_dir)) + '_' + str(count).zfill(4) + '.npz'
                 np.savez(os.path.join(out_dir, save_name), **frame_dic)
